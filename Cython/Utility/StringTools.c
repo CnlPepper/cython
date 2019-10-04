@@ -7,6 +7,40 @@
 
 #include <string>
 
+
+//////////////////// ssize_strlen.proto ////////////////////
+
+static CYTHON_INLINE Py_ssize_t __Pyx_ssize_strlen(const char *s);/*proto*/
+
+//////////////////// ssize_strlen ////////////////////
+//@requires: IncludeStringH
+
+static CYTHON_INLINE Py_ssize_t __Pyx_ssize_strlen(const char *s) {
+    size_t len = strlen(s);
+    if (unlikely(len > PY_SSIZE_T_MAX)) {
+        PyErr_SetString(PyExc_OverflowError, "byte string is too long");
+        return -1;
+    }
+    return (Py_ssize_t) len;
+}
+
+
+//////////////////// ssize_pyunicode_strlen.proto ////////////////////
+
+static CYTHON_INLINE Py_ssize_t __Pyx_Py_UNICODE_ssize_strlen(const Py_UNICODE *u);/*proto*/
+
+//////////////////// ssize_pyunicode_strlen ////////////////////
+
+static CYTHON_INLINE Py_ssize_t __Pyx_Py_UNICODE_ssize_strlen(const Py_UNICODE *u) {
+    size_t len = __Pyx_Py_UNICODE_strlen(u);
+    if (unlikely(len > PY_SSIZE_T_MAX)) {
+        PyErr_SetString(PyExc_OverflowError, "Py_UNICODE string is too long");
+        return -1;
+    }
+    return (Py_ssize_t) len;
+}
+
+
 //////////////////// InitStrings.proto ////////////////////
 
 static int __Pyx_InitStrings(__Pyx_StringTabEntry *t); /*proto*/
@@ -1100,11 +1134,12 @@ static PyObject* __Pyx_PyObject_Format(PyObject* obj, PyObject* format_spec) {
         likely(PyString_CheckExact(s)) ? PyUnicode_FromEncodedObject(s, NULL, "strict") : \
         PyObject_Format(s, f))
 #elif CYTHON_USE_TYPE_SLOTS
-    // Py3 nicely returns unicode strings from str() which makes this quite efficient for builtin types
+    // Py3 nicely returns unicode strings from str() and repr(), which makes this quite efficient for builtin types.
+    // In Py3.8+, tp_str() delegates to tp_repr(), so we call tp_repr() directly here.
     #define __Pyx_PyObject_FormatSimple(s, f) ( \
         likely(PyUnicode_CheckExact(s)) ? (Py_INCREF(s), s) : \
-        likely(PyLong_CheckExact(s)) ? PyLong_Type.tp_str(s) : \
-        likely(PyFloat_CheckExact(s)) ? PyFloat_Type.tp_str(s) : \
+        likely(PyLong_CheckExact(s)) ? PyLong_Type.tp_repr(s) : \
+        likely(PyFloat_CheckExact(s)) ? PyFloat_Type.tp_repr(s) : \
         PyObject_Format(s, f))
 #else
     #define __Pyx_PyObject_FormatSimple(s, f) ( \

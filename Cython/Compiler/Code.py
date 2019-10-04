@@ -1152,7 +1152,7 @@ class GlobalState(object):
         w.putln("")
         w.putln("static CYTHON_SMALL_CODE int __Pyx_InitCachedConstants(void) {")
         w.put_declare_refcount_context()
-        w.put_setup_refcount_context("__Pyx_InitCachedConstants")
+        w.put_setup_refcount_context(StringEncoding.EncodedString("__Pyx_InitCachedConstants"))
 
         w = self.parts['init_globals']
         w.enter_cfunc_scope()
@@ -2202,14 +2202,13 @@ class CCodeWriter(object):
             method_flags += [TypeSlots.method_coexist]
         func_ptr = wrapper_code_writer.put_pymethoddef_wrapper(entry) if wrapper_code_writer else entry.func_cname
         # Add required casts, but try not to shadow real warnings.
-        cast = '__Pyx_PyCFunctionFast' if 'METH_FASTCALL' in method_flags else 'PyCFunction'
-        if 'METH_KEYWORDS' in method_flags:
-            cast += 'WithKeywords'
+        cast = entry.signature.method_function_type()
         if cast != 'PyCFunction':
             func_ptr = '(void*)(%s)%s' % (cast, func_ptr)
+        entry_name = entry.name.as_c_string_literal()
         self.putln(
-            '{"%s", (PyCFunction)%s, %s, %s}%s' % (
-                entry.name,
+            '{%s, (PyCFunction)%s, %s, %s}%s' % (
+                entry_name,
                 func_ptr,
                 "|".join(method_flags),
                 entry.doc_cname if entry.doc else '0',
@@ -2218,8 +2217,9 @@ class CCodeWriter(object):
     def put_pymethoddef_wrapper(self, entry):
         func_cname = entry.func_cname
         if entry.is_special:
-            method_flags = entry.signature.method_flags()
-            if method_flags and 'METH_NOARGS' in method_flags:
+            method_flags = entry.signature.method_flags() or []
+            from .TypeSlots import method_noargs
+            if method_noargs in method_flags:
                 # Special NOARGS methods really take no arguments besides 'self', but PyCFunction expects one.
                 func_cname = Naming.method_wrapper_prefix + func_cname
                 self.putln("static PyObject *%s(PyObject *self, CYTHON_UNUSED PyObject *arg) {return %s(self);}" % (
@@ -2340,6 +2340,8 @@ class CCodeWriter(object):
     def error_goto(self, pos):
         lbl = self.funcstate.error_label
         self.funcstate.use_label(lbl)
+        if pos is None:
+            return 'goto %s;' % lbl
         return "__PYX_ERR(%s, %s, %s)" % (
             self.lookup_filename(pos[0]),
             pos[1],
@@ -2364,10 +2366,11 @@ class CCodeWriter(object):
         self.putln('__Pyx_RefNannyDeclarations')
 
     def put_setup_refcount_context(self, name, acquire_gil=False):
+        name = name.as_c_string_literal() # handle unicode names
         if acquire_gil:
             self.globalstate.use_utility_code(
                 UtilityCode.load_cached("ForceInitThreads", "ModuleSetupCode.c"))
-        self.putln('__Pyx_RefNannySetupContext("%s", %d);' % (name, acquire_gil and 1 or 0))
+        self.putln('__Pyx_RefNannySetupContext(%s, %d);' % (name, acquire_gil and 1 or 0))
 
     def put_finish_refcount_context(self):
         self.putln("__Pyx_RefNannyFinishContext();")
@@ -2378,14 +2381,16 @@ class CCodeWriter(object):
 
         qualified_name should be the qualified name of the function.
         """
+        qualified_name = qualified_name.as_c_string_literal() # handle unicode names
         format_tuple = (
             qualified_name,
             Naming.clineno_cname if include_cline else 0,
             Naming.lineno_cname,
             Naming.filename_cname,
         )
+
         self.funcstate.uses_error_indicator = True
-        self.putln('__Pyx_AddTraceback("%s", %s, %s, %s);' % format_tuple)
+        self.putln('__Pyx_AddTraceback(%s, %s, %s, %s);' % format_tuple)
 
     def put_unraisable(self, qualified_name, nogil=False):
         """

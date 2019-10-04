@@ -42,6 +42,28 @@ def c_safe_identifier(cname):
         cname = Naming.pyrex_prefix + cname
     return cname
 
+def punycodify_name(cname, mangle_with=None):
+    # if passed the mangle_with should be a byte string
+    # modified from  PEP489
+    try:
+        cname.encode('ascii')
+    except UnicodeEncodeError:
+        cname = cname.encode('punycode').replace(b'-', b'_').decode('ascii')
+        if mangle_with:
+            # sometimes it necessary to mangle unicode names alone where
+            # they'll be inserted directly into C, because the punycode
+            # transformation can turn them into invalid identifiers
+            cname = "%s_%s" % (mangle_with, cname)
+        elif cname.startswith(Naming.pyrex_prefix):
+            # a punycode name could also be a valid ascii variable name so
+            # change the prefix to distinguish
+            cname = cname.replace(Naming.pyrex_prefix,
+                                  Naming.pyunicode_identifier_prefix, 1)
+
+    return cname
+
+
+
 
 class BufferAux(object):
     writable_needed = False
@@ -349,7 +371,6 @@ class Scope(object):
         self.defined_c_classes = []
         self.imported_c_classes = {}
         self.cname_to_entry = {}
-        self.string_to_entry = {}
         self.identifier_to_entry = {}
         self.num_to_entry = {}
         self.obj_to_entry = {}
@@ -392,7 +413,7 @@ class Scope(object):
 
     def mangle(self, prefix, name = None):
         if name:
-            return "%s%s%s" % (prefix, self.scope_prefix, name)
+            return punycodify_name("%s%s%s" % (prefix, self.scope_prefix, name))
         else:
             return self.parent_scope.mangle(prefix, self.name)
 
@@ -447,6 +468,7 @@ class Scope(object):
         if not self.in_cinclude and cname and re.match("^_[_A-Z]+$", cname):
             # See https://www.gnu.org/software/libc/manual/html_node/Reserved-Names.html#Reserved-Names
             warning(pos, "'%s' is a reserved name in C." % cname, -1)
+
         entries = self.entries
         if name and name in entries and not shadow:
             old_entry = entries[name]
@@ -738,7 +760,7 @@ class Scope(object):
         qualified_name = self.qualify_name(lambda_name)
 
         entry = self.declare(None, func_cname, py_object_type, pos, 'private')
-        entry.name = lambda_name
+        entry.name = EncodedString(lambda_name)
         entry.qualified_name = qualified_name
         entry.pymethdef_cname = pymethdef_cname
         entry.func_cname = func_cname
@@ -825,6 +847,7 @@ class Scope(object):
         if overridable:
             # names of cpdef functions can be used as variables and can be assigned to
             var_entry = Entry(name, cname, py_object_type)   # FIXME: cname?
+            var_entry.qualified_name = self.qualify_name(name)
             var_entry.is_variable = 1
             var_entry.is_pyglobal = 1
             var_entry.scope = entry.scope
@@ -907,8 +930,7 @@ class Scope(object):
             method = obj_type.scope.lookup("operator%s" % operator)
             if method is not None:
                 arg_types = [arg.type for arg in operands[1:]]
-                res = PyrexTypes.best_match([arg.type for arg in operands[1:]],
-                                            method.all_alternatives())
+                res = PyrexTypes.best_match(arg_types, method.all_alternatives())
                 if res is not None:
                     return res
         function = self.lookup("operator%s" % operator)
@@ -1037,6 +1059,7 @@ class BuiltinScope(Scope):
             else:
                 python_equiv = EncodedString(python_equiv)
             var_entry = Entry(python_equiv, python_equiv, py_object_type)
+            var_entry.qualified_name = self.qualify_name(name)
             var_entry.is_variable = 1
             var_entry.is_builtin = 1
             var_entry.utility_code = utility_code
@@ -1060,6 +1083,7 @@ class BuiltinScope(Scope):
             type = self.lookup('type').type, # make sure "type" is the first type declared...
             pos = entry.pos,
             cname = entry.type.typeptr_cname)
+        var_entry.qualified_name = self.qualify_name(name)
         var_entry.is_variable = 1
         var_entry.is_cglobal = 1
         var_entry.is_readonly = 1
@@ -1116,7 +1140,6 @@ class ModuleScope(Scope):
     # utility_code_list    [UtilityCode]      Queuing utility codes for forwarding to Code.py
     # c_includes           {key: IncludeCode} C headers or verbatim code to be generated
     #                                         See process_include() for more documentation
-    # string_to_entry      {string : Entry}   Map string const to entry
     # identifier_to_entry  {string : Entry}   Map identifier string const to entry
     # context              Context
     # parent_module        Scope              Parent in the import namespace
@@ -1247,6 +1270,7 @@ class ModuleScope(Scope):
         else:
             entry.is_builtin = 1
             entry.name = name
+        entry.qualified_name = self.builtin_scope().qualify_name(name)
         return entry
 
     def find_module(self, module_name, pos, relative_level=-1):
@@ -1710,6 +1734,7 @@ class ModuleScope(Scope):
             type = Builtin.type_type,
             pos = entry.pos,
             cname = entry.type.typeptr_cname)
+        var_entry.qualified_name = entry.qualified_name
         var_entry.is_variable = 1
         var_entry.is_cglobal = 1
         var_entry.is_readonly = 1
@@ -1738,7 +1763,7 @@ class LocalScope(Scope):
         Scope.__init__(self, name, outer_scope, parent_scope)
 
     def mangle(self, prefix, name):
-        return prefix + name
+        return punycodify_name(prefix + name)
 
     def declare_arg(self, name, type, pos):
         # Add an entry for an argument of a function.
@@ -2144,6 +2169,7 @@ class CClassScope(ClassScope):
                 cname = name
                 if visibility == 'private':
                     cname = c_safe_identifier(cname)
+                cname = punycodify_name(cname, Naming.unicode_structmember_prefix)
             if type.is_cpp_class and visibility != 'extern':
                 type.check_nullary_constructor(pos)
                 self.use_utility_code(Code.UtilityCode("#include <new>"))
@@ -2187,6 +2213,7 @@ class CClassScope(ClassScope):
                                   # I keep it in for now. is_member should be enough
                                   # later on
             self.namespace_cname = "(PyObject *)%s" % self.parent_type.typeptr_cname
+
             return entry
 
     def declare_pyfunction(self, name, pos, allow_redefine=False):
@@ -2245,7 +2272,7 @@ class CClassScope(ClassScope):
                       (args[0].type, name, self.parent_type))
         entry = self.lookup_here(name)
         if cname is None:
-            cname = c_safe_identifier(name)
+            cname = punycodify_name(c_safe_identifier(name), Naming.unicode_vtabentry_prefix)
         if entry:
             if not entry.is_cfunction:
                 warning(pos, "'%s' redeclared  " % name, 0)
@@ -2312,6 +2339,7 @@ class CClassScope(ClassScope):
         entry = self.declare_cfunction(
             name, type, pos=None, cname=cname, visibility='extern', utility_code=utility_code)
         var_entry = Entry(name, name, py_object_type)
+        var_entry.qualified_name = name
         var_entry.is_variable = 1
         var_entry.is_builtin = 1
         var_entry.utility_code = utility_code
@@ -2425,7 +2453,7 @@ class CppClassScope(Scope):
         class_name = self.name.split('::')[-1]
         if name in (class_name, '__init__') and cname is None:
             cname = "%s__init__%s" % (Naming.func_prefix, class_name)
-            name = '<init>'
+            name = EncodedString('<init>')
             type.return_type = PyrexTypes.CVoidType()
             # This is called by the actual constructor, but need to support
             # arguments that cannot by called by value.
@@ -2439,7 +2467,7 @@ class CppClassScope(Scope):
             type.args = [maybe_ref(arg) for arg in type.args]
         elif name == '__dealloc__' and cname is None:
             cname = "%s__dealloc__%s" % (Naming.func_prefix, class_name)
-            name = '<del>'
+            name = EncodedString('<del>')
             type.return_type = PyrexTypes.CVoidType()
         if name in ('<init>', '<del>') and type.nogil:
             for base in self.type.base_classes:

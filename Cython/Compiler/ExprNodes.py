@@ -198,11 +198,13 @@ def make_dedup_key(outer_type, item_nodes):
     @return: A tuple that can be used as a dict key for deduplication.
     """
     item_keys = [
-        (py_object_type, None) if node is None
+        (py_object_type, None, type(None)) if node is None
         # For sequences and their "mult_factor", see TupleNode.
         else make_dedup_key(node.type, [node.mult_factor if node.is_literal else None] + node.args) if node.is_sequence_constructor
         else make_dedup_key(node.type, (node.start, node.stop, node.step)) if node.is_slice
-        else (node.type, node.constant_result) if node.has_constant_result()
+        # For constants, look at the Python value type if we don't know the concrete Cython type.
+        else (node.type, node.constant_result,
+              type(node.constant_result) if node.type is py_object_type else None) if node.has_constant_result()
         else None  # something we cannot handle => short-circuit below
         for node in item_nodes
     ]
@@ -873,6 +875,8 @@ class ExprNode(Node):
         #
         src = self
         src_type = self.type
+        if src_type.is_cfunction and src_type.entry.is_cgetter:
+            src_type = src_type.return_type
 
         if self.check_for_coercion_error(dst_type, env):
             return self
@@ -1202,11 +1206,15 @@ class BoolNode(ConstNode):
 
     def calculate_result_code(self):
         if self.type.is_pyobject:
-            return self.value and 'Py_True' or 'Py_False'
+            return 'Py_True' if self.value else 'Py_False'
         else:
             return str(int(self.value))
 
     def coerce_to(self, dst_type, env):
+        if dst_type == self.type:
+            return self
+        if dst_type is py_object_type and self.type is Builtin.bool_type:
+            return self
         if dst_type.is_pyobject and self.type.is_int:
             return BoolNode(
                 self.pos, value=self.value,
@@ -2289,8 +2297,10 @@ class NameNode(AtomicExprNode):
                 setter = 'PyDict_SetItem'
                 namespace = Naming.moddict_cname
             elif entry.is_pyclass_attr:
-                code.globalstate.use_utility_code(UtilityCode.load_cached("SetNameInClass", "ObjectHandling.c"))
-                setter = '__Pyx_SetNameInClass'
+                # Special-case setting __new__
+                n = "SetNewInClass" if self.name == "__new__" else "SetNameInClass"
+                code.globalstate.use_utility_code(UtilityCode.load_cached(n, "ObjectHandling.c"))
+                setter = '__Pyx_' + n
             else:
                 assert False, repr(entry)
             code.put_error_if_neg(
@@ -3627,7 +3637,10 @@ class IndexNode(_IndexingBaseNode):
         self.nogil = env.nogil
         base_type = self.base.type
 
-        if not base_type.is_cfunction:
+        if base_type.is_cfunction:
+            if self.base.entry.is_cgetter:
+                base_type = base_type.return_type
+        else:
             self.index = self.index.analyse_types(env)
             self.original_index_type = self.index.type
 
@@ -3714,7 +3727,10 @@ class IndexNode(_IndexingBaseNode):
 
     def analyse_as_c_array(self, env, is_slice):
         base_type = self.base.type
-        self.type = base_type.base_type
+        if hasattr(self.base, 'entry') and self.base.entry.is_cgetter:
+            self.type = base_type.return_type.base_type
+        else:
+            self.type = base_type.base_type
         if is_slice:
             self.type = base_type
         elif self.index.type.is_pyobject:
@@ -3963,9 +3979,12 @@ class IndexNode(_IndexingBaseNode):
             else:
                 assert False, "unexpected base type in indexing: %s" % self.base.type
         elif self.base.type.is_cfunction:
-            return "%s<%s>" % (
-                self.base.result(),
-                ",".join([param.empty_declaration_code() for param in self.type_indices]))
+            if self.base.entry.is_cgetter:
+                index_code = "(%s[%s])"
+            else:
+                return "%s<%s>" % (
+                    self.base.result(),
+                    ",".join([param.empty_declaration_code() for param in self.type_indices]))
         elif self.base.type.is_ctuple:
             index = self.index.constant_result
             if index < 0:
@@ -4716,8 +4735,17 @@ class MemoryCopyScalar(MemoryCopyNode):
             code.putln("%s __pyx_temp_slice = %s;" % (slice_decl, self.dst.result()))
             dst_temp = "__pyx_temp_slice"
 
+        force_strided = False
+        indices = self.dst.original_indices
+        for idx in indices:
+            if isinstance(idx, SliceNode) and not (idx.start.is_none and
+                                                   idx.stop.is_none and
+                                                   idx.step.is_none):
+                force_strided = True
+
         slice_iter_obj = MemoryView.slice_iter(self.dst.type, dst_temp,
-                                               self.dst.type.ndim, code)
+                                               self.dst.type.ndim, code,
+                                               force_strided=force_strided)
         p = slice_iter_obj.start_loops()
 
         if dtype.is_pyobject:
@@ -6024,10 +6052,8 @@ class PyMethodCallNode(SimpleCallNode):
 
         self_arg = code.funcstate.allocate_temp(py_object_type, manage_ref=True)
         code.putln("%s = NULL;" % self_arg)
-        arg_offset_cname = None
-        if len(args) > 1:
-            arg_offset_cname = code.funcstate.allocate_temp(PyrexTypes.c_int_type, manage_ref=False)
-            code.putln("%s = 0;" % arg_offset_cname)
+        arg_offset_cname = code.funcstate.allocate_temp(PyrexTypes.c_int_type, manage_ref=False)
+        code.putln("%s = 0;" % arg_offset_cname)
 
         def attribute_is_likely_method(attr):
             obj = attr.obj
@@ -6060,115 +6086,33 @@ class PyMethodCallNode(SimpleCallNode):
         code.put_incref("function", py_object_type)
         # free method object as early to possible to enable reuse from CPython's freelist
         code.put_decref_set(function, "function")
-        if len(args) > 1:
-            code.putln("%s = 1;" % arg_offset_cname)
+        code.putln("%s = 1;" % arg_offset_cname)
         code.putln("}")
         code.putln("}")
 
-        if not args:
-            # fastest special case: try to avoid tuple creation
-            code.globalstate.use_utility_code(
-                UtilityCode.load_cached("PyObjectCallNoArg", "ObjectHandling.c"))
-            code.globalstate.use_utility_code(
-                UtilityCode.load_cached("PyObjectCallOneArg", "ObjectHandling.c"))
-            code.putln(
-                "%s = (%s) ? __Pyx_PyObject_CallOneArg(%s, %s) : __Pyx_PyObject_CallNoArg(%s);" % (
-                    self.result(), self_arg,
-                    function, self_arg,
-                    function))
-            code.put_xdecref_clear(self_arg, py_object_type)
-            code.funcstate.release_temp(self_arg)
-            code.putln(code.error_goto_if_null(self.result(), self.pos))
-            code.put_gotref(self.py_result())
-        elif len(args) == 1:
-            # fastest special case: try to avoid tuple creation
-            code.globalstate.use_utility_code(
-                UtilityCode.load_cached("PyObjectCall2Args", "ObjectHandling.c"))
-            code.globalstate.use_utility_code(
-                UtilityCode.load_cached("PyObjectCallOneArg", "ObjectHandling.c"))
-            arg = args[0]
-            code.putln(
-                "%s = (%s) ? __Pyx_PyObject_Call2Args(%s, %s, %s) : __Pyx_PyObject_CallOneArg(%s, %s);" % (
-                    self.result(), self_arg,
-                    function, self_arg, arg.py_result(),
-                    function, arg.py_result()))
-            code.put_xdecref_clear(self_arg, py_object_type)
-            code.funcstate.release_temp(self_arg)
+        # actually call the function
+        code.globalstate.use_utility_code(
+            UtilityCode.load_cached("PyObjectFastCall", "ObjectHandling.c"))
+
+        code.putln("{")
+        code.putln("PyObject *__pyx_callargs[%d] = {%s, %s};" % (
+            len(args)+1,
+            self_arg,
+            ', '.join(arg.py_result() for arg in args)))
+        code.putln("%s = __Pyx_PyObject_FastCall(%s, __pyx_callargs+1-%s, %d+%s);" % (
+            self.result(),
+            function,
+            arg_offset_cname,
+            len(args),
+            arg_offset_cname))
+
+        code.put_xdecref_clear(self_arg, py_object_type)
+        code.funcstate.release_temp(self_arg)
+        for arg in args:
             arg.generate_disposal_code(code)
             arg.free_temps(code)
-            code.putln(code.error_goto_if_null(self.result(), self.pos))
-            code.put_gotref(self.py_result())
-        else:
-            code.globalstate.use_utility_code(
-                UtilityCode.load_cached("PyFunctionFastCall", "ObjectHandling.c"))
-            code.globalstate.use_utility_code(
-                UtilityCode.load_cached("PyCFunctionFastCall", "ObjectHandling.c"))
-            for test_func, call_prefix in [('PyFunction_Check', 'Py'), ('__Pyx_PyFastCFunction_Check', 'PyC')]:
-                code.putln("#if CYTHON_FAST_%sCALL" % call_prefix.upper())
-                code.putln("if (%s(%s)) {" % (test_func, function))
-                code.putln("PyObject *%s[%d] = {%s, %s};" % (
-                    Naming.quick_temp_cname,
-                    len(args)+1,
-                    self_arg,
-                    ', '.join(arg.py_result() for arg in args)))
-                code.putln("%s = __Pyx_%sFunction_FastCall(%s, %s+1-%s, %d+%s); %s" % (
-                    self.result(),
-                    call_prefix,
-                    function,
-                    Naming.quick_temp_cname,
-                    arg_offset_cname,
-                    len(args),
-                    arg_offset_cname,
-                    code.error_goto_if_null(self.result(), self.pos)))
-                code.put_xdecref_clear(self_arg, py_object_type)
-                code.put_gotref(self.py_result())
-                for arg in args:
-                    arg.generate_disposal_code(code)
-                code.putln("} else")
-                code.putln("#endif")
-
-            code.putln("{")
-            args_tuple = code.funcstate.allocate_temp(py_object_type, manage_ref=True)
-            code.putln("%s = PyTuple_New(%d+%s); %s" % (
-                args_tuple, len(args), arg_offset_cname,
-                code.error_goto_if_null(args_tuple, self.pos)))
-            code.put_gotref(args_tuple)
-
-            if len(args) > 1:
-                code.putln("if (%s) {" % self_arg)
-            code.putln("__Pyx_GIVEREF(%s); PyTuple_SET_ITEM(%s, 0, %s); %s = NULL;" % (
-                self_arg, args_tuple, self_arg, self_arg))  # stealing owned ref in this case
-            code.funcstate.release_temp(self_arg)
-            if len(args) > 1:
-                code.putln("}")
-
-            for i, arg in enumerate(args):
-                arg.make_owned_reference(code)
-                code.put_giveref(arg.py_result())
-                code.putln("PyTuple_SET_ITEM(%s, %d+%s, %s);" % (
-                    args_tuple, i, arg_offset_cname, arg.py_result()))
-            if len(args) > 1:
-                code.funcstate.release_temp(arg_offset_cname)
-
-            for arg in args:
-                arg.generate_post_assignment_code(code)
-                arg.free_temps(code)
-
-            code.globalstate.use_utility_code(
-                UtilityCode.load_cached("PyObjectCall", "ObjectHandling.c"))
-            code.putln(
-                "%s = __Pyx_PyObject_Call(%s, %s, NULL); %s" % (
-                    self.result(),
-                    function, args_tuple,
-                    code.error_goto_if_null(self.result(), self.pos)))
-            code.put_gotref(self.py_result())
-
-            code.put_decref_clear(args_tuple, py_object_type)
-            code.funcstate.release_temp(args_tuple)
-
-            if len(args) == 1:
-                code.putln("}")
-            code.putln("}")  # !CYTHON_FAST_PYCALL
+        code.putln(code.error_goto_if_null(self.result(), self.pos))
+        code.put_gotref(self.py_result())
 
         if reuse_function_temp:
             self.function.generate_disposal_code(code)
@@ -6176,6 +6120,7 @@ class PyMethodCallNode(SimpleCallNode):
         else:
             code.put_decref_clear(function, py_object_type)
             code.funcstate.release_temp(function)
+        code.putln("}")
 
 
 class InlinedDefNodeCallNode(CallNode):
@@ -9201,7 +9146,6 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
     #  from a PyMethodDef struct.
     #
     #  pymethdef_cname   string             PyMethodDef structure
-    #  self_object       ExprNode or None
     #  binding           bool
     #  def_node          DefNode            the Python function node
     #  module_name       EncodedString      Name of defining module
@@ -9210,7 +9154,6 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
     subexprs = ['code_object', 'defaults_tuple', 'defaults_kwdict',
                 'annotations_dict']
 
-    self_object = None
     code_object = None
     binding = False
     def_node = None
@@ -9381,12 +9324,8 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
 
     gil_message = "Constructing Python function"
 
-    def self_result_code(self):
-        if self.self_object is None:
-            self_result = "NULL"
-        else:
-            self_result = self.self_object.py_result()
-        return self_result
+    def closure_result_code(self):
+        return "NULL"
 
     def generate_result_code(self, code):
         if self.binding:
@@ -9400,7 +9339,7 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
             '%s = PyCFunction_NewEx(&%s, %s, %s); %s' % (
                 self.result(),
                 self.pymethdef_cname,
-                self.self_result_code(),
+                self.closure_result_code(),
                 py_mod_name,
                 code.error_goto_if_null(self.result(), self.pos)))
 
@@ -9447,7 +9386,7 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
                 self.pymethdef_cname,
                 flags,
                 self.get_py_qualified_name(code),
-                self.self_result_code(),
+                self.closure_result_code(),
                 self.get_py_mod_name(code),
                 Naming.moddict_cname,
                 code_object_result,
@@ -9493,13 +9432,12 @@ class PyCFunctionNode(ExprNode, ModuleNameMixin):
 
 class InnerFunctionNode(PyCFunctionNode):
     # Special PyCFunctionNode that depends on a closure class
-    #
 
     binding = True
-    needs_self_code = True
+    needs_closure_code = True
 
-    def self_result_code(self):
-        if self.needs_self_code:
+    def closure_result_code(self):
+        if self.needs_closure_code:
             return "((PyObject*)%s)" % Naming.cur_scope_cname
         return "NULL"
 
@@ -9557,9 +9495,10 @@ class CodeObjectNode(ExprNode):
         if self.def_node.starstar_arg:
             flags.append('CO_VARKEYWORDS')
 
-        code.putln("%s = (PyObject*)__Pyx_PyCode_New(%d, %d, %d, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, %d, %s); %s" % (
+        code.putln("%s = (PyObject*)__Pyx_PyCode_New(%d, %d, %d, %d, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, %d, %s); %s" % (
             self.result_code,
             len(func.args) - func.num_kwonly_args,  # argcount
+            func.num_posonly_args,     # posonlyargcount (Py3.8+ only)
             func.num_kwonly_args,      # kwonlyargcount (Py3 only)
             len(self.varnames.args),   # nlocals
             '|'.join(flags) or '0',    # flags
@@ -9681,8 +9620,8 @@ class LambdaNode(InnerFunctionNode):
         self.lambda_name = self.def_node.lambda_name = env.next_id('lambda')
         self.def_node.no_assignment_synthesis = True
         self.def_node.pymethdef_required = True
-        self.def_node.analyse_declarations(env)
         self.def_node.is_cyfunction = True
+        self.def_node.analyse_declarations(env)
         self.pymethdef_cname = self.def_node.entry.pymethdef_cname
         env.add_lambda_def(self.def_node)
 
@@ -9721,7 +9660,7 @@ class GeneratorExpressionNode(LambdaNode):
             '%s = %s(%s); %s' % (
                 self.result(),
                 self.def_node.entry.pyfunc_cname,
-                self.self_result_code(),
+                self.closure_result_code(),
                 code.error_goto_if_null(self.result(), self.pos)))
         code.put_gotref(self.py_result())
 
@@ -11552,7 +11491,7 @@ class DivNode(NumBinopNode):
                 self.operand2 = self.operand2.coerce_to_simple(env)
 
     def compute_c_result_type(self, type1, type2):
-        if self.operator == '/' and self.ctruedivision:
+        if self.operator == '/' and self.ctruedivision and not type1.is_cpp_class and not type2.is_cpp_class:
             if not type1.is_float and not type2.is_float:
                 widest_type = PyrexTypes.widest_numeric_type(type1, PyrexTypes.c_double_type)
                 widest_type = PyrexTypes.widest_numeric_type(type2, widest_type)
@@ -11643,7 +11582,7 @@ class DivNode(NumBinopNode):
                 code.putln("}")
 
     def calculate_result_code(self):
-        if self.type.is_complex:
+        if self.type.is_complex or self.is_cpp_operation():
             return NumBinopNode.calculate_result_code(self)
         elif self.type.is_float and self.operator == '//':
             return "floor(%s / %s)" % (
@@ -12279,6 +12218,10 @@ class CmpNode(object):
         operand2 = self.operand2
         type1 = operand1.type
         type2 = operand2.type
+        if type1.is_cfunction and type1.entry.is_cgetter:
+            type1 = type1.return_type
+        if type2.is_cfunction and type2.entry.is_cgetter:
+            type2 = type2.return_type
 
         new_common_type = None
 

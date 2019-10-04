@@ -194,14 +194,6 @@ static PyObject *__Pyx__Coroutine_GetAwaitableIter(PyObject *obj) {
         PyObject *method = NULL;
         int is_method = __Pyx_PyObject_GetMethod(obj, PYIDENT("__await__"), &method);
         if (likely(is_method)) {
-#if PY_VERSION_HEX >= 0x030700A1 && CYTHON_UNPACK_METHODS && CYTHON_FAST_PYCCALL
-            if (Py_TYPE(method) == &PyMethodDescr_Type) {
-                PyMethodDescrObject *descr = (PyMethodDescrObject *)method;
-                res = _PyMethodDef_RawFastCallKeywords(descr->d_method, obj, NULL, 0, NULL);
-                if (unlikely(!res))
-                    res = _Py_CheckFunctionResult(obj, res, NULL);
-            } else
-#endif
             res = __Pyx_PyObject_CallOneArg(method, obj);
         } else if (likely(method)) {
             res = __Pyx_PyObject_CallNoArg(method);
@@ -1531,6 +1523,9 @@ static PyTypeObject __pyx_CoroutineAwaitType_type = {
 #if PY_VERSION_HEX >= 0x030400a1
     0,                                  /*tp_finalize*/
 #endif
+#if PY_VERSION_HEX >= 0x030800b1
+    0,                                  /*tp_vectorcall*/
+#endif
 };
 
 #if PY_VERSION_HEX < 0x030500B1 || defined(__Pyx_IterableCoroutine_USED) || CYTHON_USE_ASYNC_SLOTS
@@ -1682,6 +1677,9 @@ static PyTypeObject __pyx_CoroutineType_type = {
 #elif PY_VERSION_HEX >= 0x030400a1
     0,                                  /*tp_finalize*/
 #endif
+#if PY_VERSION_HEX >= 0x030800b1
+    0,                                  /*tp_vectorcall*/
+#endif
 };
 
 static int __pyx_Coroutine_init(void) {
@@ -1787,6 +1785,9 @@ static PyTypeObject __pyx_IterableCoroutineType_type = {
 #if PY_VERSION_HEX >= 0x030400a1
     __Pyx_Coroutine_del,                /*tp_finalize*/
 #endif
+#if PY_VERSION_HEX >= 0x030800b1
+    0,                                  /*tp_vectorcall*/
+#endif
 };
 
 
@@ -1888,6 +1889,9 @@ static PyTypeObject __pyx_GeneratorType_type = {
     __Pyx_Coroutine_del,                /*tp_finalize*/
 #elif PY_VERSION_HEX >= 0x030400a1
     0,                                  /*tp_finalize*/
+#endif
+#if PY_VERSION_HEX >= 0x030800b1
+    0,                                  /*tp_vectorcall*/
 #endif
 };
 

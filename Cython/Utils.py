@@ -216,7 +216,7 @@ def decode_filename(filename):
 _match_file_encoding = re.compile(br"(\w*coding)[:=]\s*([-\w.]+)").search
 
 
-def detect_opened_file_encoding(f):
+def detect_opened_file_encoding(f, default='UTF-8'):
     # PEPs 263 and 3120
     # Most of the time the first two lines fall in the first couple of hundred chars,
     # and this bulk read/split is much faster.
@@ -236,7 +236,7 @@ def detect_opened_file_encoding(f):
         m = _match_file_encoding(lines[1])
         if m:
             return m.group(2).decode('iso8859-1')
-    return "UTF-8"
+    return default
 
 
 def skip_bom(f):
@@ -474,7 +474,7 @@ def raise_error_if_module_name_forbidden(full_module_name):
 
 def build_hex_version(version_string):
     """
-    Parse and translate '4.3a1' into the readable hex representation '0x040300A1' (like PY_HEX_VERSION).
+    Parse and translate '4.3a1' into the readable hex representation '0x040300A1' (like PY_VERSION_HEX).
     """
     # First, parse '4.12a1' into [4, 12, 0, 0xA01].
     digits = []
